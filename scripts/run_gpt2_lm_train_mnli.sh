@@ -1,0 +1,5 @@
+# generation
+python ./src/method1/run_gpt2_lm_train_mnli.py --model_name_or_path=/home/niuyilin/pre-trained-models/gpt2-large --output_dir=./runs/GPT2-large-LM-trainONmnli-bs8/checkpoint-12000 --model_type=gpt2 --train_data_file=./data/COPA/COPA-resources/datasets/copa-dev.xml --eval_data_file=./data/COPA/COPA-resources/datasets/copa-test.xml --do_generate --repetition_penalty=1
+
+# train (mask the one entire premise sentence): loss = -P(pos)
+# python ./src/method1/run_gpt2_lm_train_mnli.py --model_name_or_path=/home/niuyilin/pre-trained-models/gpt2-large --output_dir=./runs/GPT2-large-LM-trainONmnli-bs8 --num_train_epochs=4 --learning_rate=1e-5 --model_type=gpt2 --do_train --train_data_file=./data/MNLI/multinli_1.0/train.txt --do_eval --eval_data_file=./data/MNLI/multinli_1.0/valid.txt --per_gpu_train_batch_size=8 --per_gpu_eval_batch_size=8 --gradient_accumulation_steps=1 --evaluate_during_training --save_steps=1000 --logging_steps=50
