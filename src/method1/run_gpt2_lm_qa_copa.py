@@ -503,17 +503,22 @@ class TextDataset(Dataset):
 
             self.corpus = []
             with open(file_path, encoding="utf-8") as f:
+                sentence = None
+                query_type = None
                 for text in f:
                     text = text.strip()
                     if text[:3] == '<p>':
-                        sentence = text[3:-4]
+                        sentence = text[3:-4].strip()[:-1] + ' ' + query_type
+                    elif 'most-plausible-alternative' in text:
+                        if 'effect' in text:
+                            query_type = 'so'
+                        elif 'cause' in text:
+                            query_type = 'because'
                         continue
-                    elif text[:4] in ['<a1>', '<a2>']:
-                        sentence = text[4:-5]
                     else:
                         continue
 
-                    self.corpus.append(upper_first_word(sentence))
+                    self.corpus.append(sentence)
 
             logger.info("Saving features into cached file %s", cached_features_file)
             with open(cached_features_file, "wb") as handle:
@@ -852,7 +857,7 @@ def generate(model, tokenizer, encoded_prompts, num_return_sequences=30, repetit
         DQ_text = tokenizer.decode(encoded_prompt[0], clean_up_tokenization_spaces=True)
         output_sequences = model.generate(
             input_ids=encoded_prompt,
-            max_length=5 + 2 * len(encoded_prompt[0]),
+            max_length=15 + len(encoded_prompt[0]),
             temperature=1.,
             top_k=top_k,
             top_p=top_p,
@@ -881,7 +886,7 @@ def generate(model, tokenizer, encoded_prompts, num_return_sequences=30, repetit
                 continue
 
         print(len(new_output_sequences))
-        if len(new_output_sequences) > 200:
+        if len(new_output_sequences) > 2000:
             break
 
     generated_sequences = []
@@ -924,25 +929,21 @@ def generate_file(args, model, tokenizer):
 
     for sentence in eval_dataset:
 
-        tokenized_prompts = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s' % (upper_first_word(corrupt.corrupt(sentence, save_prob=1, shuffle_prob=0, replace_prob=0)), sep_token))) for i in range(1)]
+        tokenized_prompts = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize(sentence)) for i in range(1)]
         with torch.no_grad():
             input_ids = [torch.tensor([tokenized_prompt]).long().to(args.device) for tokenized_prompt in tokenized_prompts]
-            entire_texts, generated_sequences = generate(model, tokenizer, input_ids, num_return_sequences=300, repetition_penalty=args.repetition_penalty)
+            entire_texts, generated_sequences = generate(model, tokenizer, input_ids, num_return_sequences=300, repetition_penalty=args.repetition_penalty, top_k=0, top_p=1)
 
-        probs = calc_probs(args, model, tokenizer, entire_texts[0][:-len(generated_sequences[0])].strip(), generated_sequences)
-
-        generated_sequences = [(upper_first_word(generated_sequence), prob) for generated_sequence, prob in zip(generated_sequences, probs)]
-        print(entire_texts[0][:-len(generated_sequences[0][0])])
+        print(entire_texts[0][:-len(generated_sequences[0])])
         print(generated_sequences[0])
         print('Generated number: ', len(generated_sequences))
         generated_sequences_list.append(generated_sequences)
         print('%d%s' % (len(generated_sequences_list), '=' * 20))
-        assert len(set([generated_sequence[0] for generated_sequence in generated_sequences])) == len(set([generated_sequence[1] for generated_sequence in generated_sequences]))
 
         if random.random() > 0.95:
-            pickle.dump(generated_sequences_list, open(args.eval_data_file + '.trainONmnli12000.paraphrase.%.2fpenalty.sample.pkl' % (args.repetition_penalty), 'wb'))
+            pickle.dump(generated_sequences_list, open(args.eval_data_file + '.gpt2large.qa.%.2fpenalty.sample.pkl' % (args.repetition_penalty), 'wb'))
 
-    pickle.dump(generated_sequences_list, open(args.eval_data_file + '.trainONmnli12000.paraphrase.%.2fpenalty.sample.pkl' % (args.repetition_penalty), 'wb'))
+    pickle.dump(generated_sequences_list, open(args.eval_data_file + '.gpt2large.qa.%.2fpenalty.sample.pkl' % (args.repetition_penalty), 'wb'))
 
 def upper_first_word(sentence):
     sentence = [word for word in sentence.split(' ') if word != '']

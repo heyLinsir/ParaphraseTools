@@ -7,7 +7,7 @@ stop_words = set(stopwords.words('english'))
 print('Load %d stop words.' % (len(stop_words)))
 
 def remove_stop_words(words, save_prob=0):
-	return [word for word in words if word not in stop_words or random.random() < save_prob]
+	return [word for word in words if word not in stop_words or random.random() < save_prob or word.lower() in ['i', 'he', 'she', 'it', 'me', 'him', 'her', 'us', 'our', 'we', 'my', 'his']]
 
 def shuffle(words, shuffle_prob=0):
 	if random.random() < shuffle_prob:

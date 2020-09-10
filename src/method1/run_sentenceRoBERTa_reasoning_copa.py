@@ -118,7 +118,7 @@ MODEL_CLASSES = {
     "camembert": (CamembertConfig, CamembertForMaskedLM, CamembertTokenizer),
 }
 
-generation_file_postfix = 'trainONmnli12000.paraphrase.1.00penalty.sample'
+generation_file_postfix = 'gpt2large.qa.1.00penalty.sample'
 
 def upper_first_word(sentence):
     sentence = [word for word in sentence.split(' ') if word != '']
@@ -136,43 +136,46 @@ class TextDataset(Dataset):
 
         logger.info("Creating features from dataset file at %s", directory)
         paraphrases = pickle.load(open('%s.%s.pkl' % (file_path, generation_file_postfix), 'rb'))
+        for i, paraphrase in enumerate(paraphrases):
+            paraphrases[i] = [upper_first_word(_paraphrase) for _paraphrase in paraphrase]
 
         cls_token, end_token = '<s>', '</s>'
 
         self.examples = []
         with open(file_path, encoding="utf-8") as f:
+            options = []
+            label = None
             for text in f:
                 text = text.strip()
-                if text[:3] == '<p>':
-                    sentence = text[3:-4]
+                if text[:4] in ['<a1>', '<a2>']:
+                    sentence = upper_first_word(text[4:-5].strip())
+                elif 'most-plausible-alternative' in text:
+                    label = int(text[-3]) - 1
                     continue
-                elif text[:4] in ['<a1>', '<a2>']:
-                    sentence = ' '.join([word for word in text[4:-5].strip().split(' ') if word != ''])
                 else:
                     continue
 
-                sentence = upper_first_word(sentence)
+                options.append(sentence)
+                assert len(options) <= 2
+                if len(options) < 2:
+                    continue
+                options = [options[label], options[1 - label]]
 
-                tokenized_sentence = tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, sentence, end_token)))
-                tokenized_paraphrases = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, paraphrase[0], end_token))) for paraphrase in paraphrases[0]]
+                tokenized_paraphrases = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, paraphrase, end_token))) for paraphrase in options + paraphrases[0]]
                 current_paraphrases = paraphrases[0]
                 paraphrases = paraphrases[1:]
 
-                # print(sentence)
-                # print(tokenized_sentence)
-                # for paraphrase, tokenized_paraphrase in zip(current_paraphrases, tokenized_paraphrases):
-                #     print(paraphrase)
-                #     print(tokenized_paraphrase)
-                # input()
-                input_ids = [torch.tensor(_input_ids) for _input_ids in [tokenized_sentence] + tokenized_paraphrases]
+                input_ids = [torch.tensor(_input_ids) for _input_ids in tokenized_paraphrases]
                 attention_mask = [torch.tensor([1] * len(_input_ids)) for _input_ids in input_ids]
 
                 example = {'input_ids': input_ids,
                             'attention_mask': attention_mask,
-                            'num_paraphrases': len(input_ids) - 1,
+                            'num_paraphrases': len(input_ids) - 2,
                             'paraphrases': current_paraphrases}
 
                 self.examples.append(example)
+
+                options = []
 
     def __len__(self):
         return len(self.examples)
@@ -517,8 +520,14 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
     pos_factor_list = []
     neg_factor_list = []
 
-    paraphrase_score_pairs_list = []
-    score_list = []
+    acc = []
+    def logging_info(scores):
+        scores = scores.tolist()
+        total_num = len(scores)
+        for i in range(10):
+            pre_bank, post_bank = i * 0.1, (i + 1) * 0.1
+            range_num = sum([1. if score > pre_bank and score < post_bank else 0. for score in scores])
+            print('\t(%.2f, %.2f): %d(%f)' % (pre_bank, post_bank, range_num, range_num / total_num))
     for batch, num_paraphrases, paraphrases in tqdm(eval_dataloader, desc="Evaluating"):
         # for batch in batchs:
         batch['input_ids'] = batch['input_ids'].to(args.device)
@@ -527,24 +536,30 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
         with torch.no_grad():
             h_cls = model(**batch) # [batch, hidden_size]
 
+            # mean_state = h_cls.mean(dim=0).unsqueeze(dim=0)
+            # h_cls = h_cls - mean_state
+
             factor_fn = calc_cosine
-            scores = factor_fn(h_cls[0].unsqueeze(dim=0), h_cls[1:]).tolist()
-            paraphrases = paraphrases[0]
-            paraphrase_score_pairs = [(paraphrase[0], paraphrase[1], score) for paraphrase, score in zip(paraphrases, scores)]
+            pos_scores = torch.sigmoid((factor_fn(h_cls[0].unsqueeze(dim=0), h_cls[2:]) - .5) * 5.)
+            neg_scores = torch.sigmoid((factor_fn(h_cls[1].unsqueeze(dim=0), h_cls[2:]) - .5) * 5.)
+            acc.append(float(pos_scores.mean().item() > neg_scores.mean().item()))
 
-            paraphrase_score_pairs = sorted(paraphrase_score_pairs, key=lambda x: x[2], reverse=True)
-            score_list.append(np.mean([score for (_, _, score) in paraphrase_score_pairs[:10]]))
+            print('============Example %d: accumulated accuracy is %f=============' % (len(acc), np.mean(acc)))
+            if acc[-1] > 0:
+                print('Right prediction!')
+            else:
+                print('Wrong prediction!')
+            print('Positive score:', pos_scores.mean().item())
+            print('Negative score:', neg_scores.mean().item())
+            print('Positive option:')
+            logging_info(pos_scores)
+            print('Negative option:')
+            logging_info(neg_scores)
 
-            paraphrase_score_pairs_list.append(paraphrase_score_pairs)
-            if random.random() < 0.05:
-                pickle.dump(paraphrase_score_pairs_list, open('%s.%s.filtered.pkl' % (args.eval_data_file, generation_file_postfix), 'wb'))
-
-    result = {"top_10_score": np.mean(score_list)}
+    result = {"acc": np.mean(acc)}
 
     for key in sorted(result.keys()):
         logger.info("  %s = %s", key, str(result[key]))
-
-    pickle.dump(paraphrase_score_pairs_list, open('%s.%s.filtered.pkl' % (args.eval_data_file, generation_file_postfix), 'wb'))
 
     return result
 

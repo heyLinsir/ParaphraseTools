@@ -28,7 +28,6 @@ import pickle
 import random
 import re
 import shutil
-import csv
 import json
 from typing import Dict, List, Tuple
 
@@ -73,48 +72,13 @@ try:
 except ImportError:
     from tensorboardX import SummaryWriter
 
-
-import corrupt
-
-end_token, sep_token = '<|endoftext|>', '<|sepoftext|>'
-tokenizer = None
-
 logger = logging.getLogger(__name__)
 
-class NewRobertaForMaskedLM(RobertaForMaskedLM):
-    
-    def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        masked_lm_labels=None,
-        num_samples=None,
-        log_factors=None
-    ):
-        outputs = self.roberta(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-        )
-        sequence_output = outputs[0] # [batch, seq_length, hidden_size]
-        
-        mean_state = []
-        for _sequence_output, _attention_mask in zip(sequence_output, attention_mask):
-            seq_length = int(_attention_mask.sum().item()) - 2
-            mean_state.append(_sequence_output[1:seq_length + 1].mean(dim=0))
-        mean_state = torch.stack(mean_state, dim=0) # [batch, hidden_size]
-
-        return mean_state
+END_ID, PAD_ID = 50256, 50256
 
 class NewGPT2LMHeadModel(GPT2LMHeadModel):
-    def prob_forward(
+
+    def forward(
         self,
         input_ids=None,
         past=None,
@@ -187,274 +151,6 @@ class NewGPT2LMHeadModel(GPT2LMHeadModel):
 
         return outputs  # (loss), lm_logits, presents, (all hidden_states), (attentions)
 
-    @torch.no_grad()
-    def generate(
-        self,
-        input_ids=None,
-        max_length=None,
-        min_length=None,
-        do_sample=None,
-        early_stopping=None,
-        num_beams=None,
-        temperature=None,
-        top_k=None,
-        top_p=None,
-        repetition_penalty=None,
-        bad_words_ids=None,
-        bos_token_id=None,
-        pad_token_id=None,
-        eos_token_id=None,
-        length_penalty=None,
-        no_repeat_ngram_size=None,
-        num_return_sequences=None,
-        attention_mask=None,
-        decoder_start_token_id=None,
-    ):
-
-        # We cannot generate if the model does not have a LM head
-        if self.get_output_embeddings() is None:
-            raise AttributeError(
-                "You tried to generate sequences with a model that does not have a LM Head."
-                "Please use another model class (e.g. `OpenAIGPTLMHeadModel`, `XLNetLMHeadModel`, `GPT2LMHeadModel`, `CTRLLMHeadModel`, `T5WithLMHeadModel`, `TransfoXLLMHeadModel`, `XLMWithLMHeadModel`, `BartForConditionalGeneration` )"
-            )
-
-        max_length = max_length if max_length is not None else self.config.max_length
-        min_length = min_length if min_length is not None else self.config.min_length
-        do_sample = do_sample if do_sample is not None else self.config.do_sample
-        early_stopping = early_stopping if early_stopping is not None else self.config.early_stopping
-        num_beams = num_beams if num_beams is not None else self.config.num_beams
-        temperature = temperature if temperature is not None else self.config.temperature
-        top_k = top_k if top_k is not None else self.config.top_k
-        top_p = top_p if top_p is not None else self.config.top_p
-        repetition_penalty = repetition_penalty if repetition_penalty is not None else self.config.repetition_penalty
-        bos_token_id = bos_token_id if bos_token_id is not None else self.config.bos_token_id
-        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
-        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
-        length_penalty = length_penalty if length_penalty is not None else self.config.length_penalty
-        no_repeat_ngram_size = (
-            no_repeat_ngram_size if no_repeat_ngram_size is not None else self.config.no_repeat_ngram_size
-        )
-        bad_words_ids = bad_words_ids if bad_words_ids is not None else self.config.bad_words_ids
-        num_return_sequences = (
-            num_return_sequences if num_return_sequences is not None else self.config.num_return_sequences
-        )
-        decoder_start_token_id = (
-            decoder_start_token_id if decoder_start_token_id is not None else self.config.decoder_start_token_id
-        )
-
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]  # overriden by the input batch_size
-        else:
-            batch_size = 1
-
-        assert isinstance(max_length, int) and max_length > 0, "`max_length` should be a strictly positive integer."
-        assert isinstance(min_length, int) and min_length >= 0, "`min_length` should be a positive integer."
-        assert isinstance(do_sample, bool), "`do_sample` should be a boolean."
-        assert isinstance(early_stopping, bool), "`early_stopping` should be a boolean."
-        assert isinstance(num_beams, int) and num_beams > 0, "`num_beams` should be a strictly positive integer."
-        assert temperature > 0, "`temperature` should be strictly positive."
-        assert isinstance(top_k, int) and top_k >= 0, "`top_k` should be a positive integer."
-        assert 0 <= top_p <= 1, "`top_p` should be between 0 and 1."
-        assert repetition_penalty >= 0., "`repetition_penalty` should be >= 0."
-        assert input_ids is not None or (
-            isinstance(bos_token_id, int) and bos_token_id >= 0
-        ), "If input_ids is not defined, `bos_token_id` should be a positive integer."
-        assert pad_token_id is None or (
-            isinstance(pad_token_id, int) and (pad_token_id >= 0)
-        ), "`pad_token_id` should be a positive integer."
-        assert (eos_token_id is None) or (
-            isinstance(eos_token_id, int) and (eos_token_id >= 0)
-        ), "`eos_token_id` should be a positive integer."
-        assert length_penalty > 0, "`length_penalty` should be strictly positive."
-        assert (
-            isinstance(no_repeat_ngram_size, int) and no_repeat_ngram_size >= 0
-        ), "`no_repeat_ngram_size` should be a positive integer."
-        assert (
-            isinstance(num_return_sequences, int) and num_return_sequences > 0
-        ), "`num_return_sequences` should be a strictly positive integer."
-        assert (
-            bad_words_ids is None or isinstance(bad_words_ids, list) and isinstance(bad_words_ids[0], list)
-        ), "`bad_words_ids` is either `None` or a list of lists of tokens that should not be generated"
-
-        if input_ids is None:
-            assert isinstance(bos_token_id, int) and bos_token_id >= 0, (
-                "you should either supply a context to complete as `input_ids` input "
-                "or a `bos_token_id` (integer >= 0) as a first token to start the generation."
-            )
-            input_ids = torch.full(
-                (batch_size, 1), bos_token_id, dtype=torch.long, device=next(self.parameters()).device,
-            )
-        else:
-            assert input_ids.dim() == 2, "Input prompt should be of shape (batch_size, sequence length)."
-
-        # not allow to duplicate outputs when greedy decoding
-        if do_sample is False:
-            if num_beams == 1:
-                # no_beam_search greedy generation conditions
-                assert (
-                    num_return_sequences == 1
-                ), "Greedy decoding will always produce the same output for num_beams == 1 and num_return_sequences > 1. Please set num_return_sequences = 1"
-
-            else:
-                # beam_search greedy generation conditions
-                assert (
-                    num_beams >= num_return_sequences
-                ), "Greedy beam search decoding cannot return more sequences than it has beams. Please set num_beams >= num_return_sequences"
-
-        # create attention mask if necessary
-        # TODO (PVP): this should later be handled by the forward fn() in each model in the future see PR 3140
-        if (attention_mask is None) and (pad_token_id is not None) and (pad_token_id in input_ids):
-            attention_mask = input_ids.ne(pad_token_id).long()
-        elif attention_mask is None:
-            attention_mask = input_ids.new_ones(input_ids.shape)
-
-        # set pad_token_id to eos_token_id if not set. Important that this is done after
-        # attention_mask is created
-        if pad_token_id is None and eos_token_id is not None:
-            logger.warning(
-                "Setting `pad_token_id` to {} (first `eos_token_id`) to generate sequence".format(eos_token_id)
-            )
-            pad_token_id = eos_token_id
-
-        # current position and vocab size
-        vocab_size = self.config.vocab_size
-
-        # set effective batch size and effective batch multiplier according to do_sample
-        if do_sample:
-            effective_batch_size = batch_size * num_return_sequences
-            effective_batch_mult = num_return_sequences
-        else:
-            effective_batch_size = batch_size
-            effective_batch_mult = 1
-
-        if self.config.is_encoder_decoder:
-            if decoder_start_token_id is None:
-                decoder_start_token_id = bos_token_id
-
-            assert (
-                decoder_start_token_id is not None
-            ), "decoder_start_token_id or bos_token_id has to be defined for encoder-decoder generation"
-            assert hasattr(self, "get_encoder"), "{} should have a 'get_encoder' function defined".format(self)
-            assert callable(self.get_encoder), "{} should be a method".format(self.get_encoder)
-
-            # get encoder and store encoder outputs
-            encoder = self.get_encoder()
-
-            encoder_outputs = encoder(input_ids, attention_mask=attention_mask)
-
-        # Expand input ids if num_beams > 1 or num_return_sequences > 1
-        if num_return_sequences > 1 or num_beams > 1:
-            input_ids_len = input_ids.shape[-1]
-            input_ids = input_ids.unsqueeze(1).expand(batch_size, effective_batch_mult * num_beams, input_ids_len)
-            attention_mask = attention_mask.unsqueeze(1).expand(
-                batch_size, effective_batch_mult * num_beams, input_ids_len
-            )
-
-            input_ids = input_ids.contiguous().view(
-                effective_batch_size * num_beams, input_ids_len
-            )  # shape: (batch_size * num_return_sequences * num_beams, cur_len)
-            attention_mask = attention_mask.contiguous().view(
-                effective_batch_size * num_beams, input_ids_len
-            )  # shape: (batch_size * num_return_sequences * num_beams, cur_len)
-
-        if self.config.is_encoder_decoder:
-            # create empty decoder_input_ids
-            input_ids = torch.full(
-                (effective_batch_size * num_beams, 1),
-                decoder_start_token_id,
-                dtype=torch.long,
-                device=next(self.parameters()).device,
-            )
-            cur_len = 1
-
-            assert (
-                batch_size == encoder_outputs[0].shape[0]
-            ), f"expected encoder_outputs[0] to have 1st dimension bs={batch_size}, got {encoder_outputs[0].shape[0]} "
-
-            # expand batch_idx to assign correct encoder output for expanded input_ids (due to num_beams > 1 and num_return_sequences > 1)
-            expanded_batch_idxs = (
-                torch.arange(batch_size)
-                .view(-1, 1)
-                .repeat(1, num_beams * effective_batch_mult)
-                .view(-1)
-                .to(input_ids.device)
-            )
-            # expand encoder_outputs
-            encoder_outputs = (encoder_outputs[0].index_select(0, expanded_batch_idxs), *encoder_outputs[1:])
-
-        else:
-            encoder_outputs = None
-            cur_len = input_ids.shape[-1]
-
-        self.prompt_inputs = input_ids.clone().detach()
-        if num_beams > 1:
-            output = self._generate_beam_search(
-                input_ids,
-                cur_len=cur_len,
-                max_length=max_length,
-                min_length=min_length,
-                do_sample=do_sample,
-                early_stopping=early_stopping,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-                bad_words_ids=bad_words_ids,
-                bos_token_id=bos_token_id,
-                pad_token_id=pad_token_id,
-                decoder_start_token_id=decoder_start_token_id,
-                eos_token_id=eos_token_id,
-                batch_size=effective_batch_size,
-                num_return_sequences=num_return_sequences,
-                length_penalty=length_penalty,
-                num_beams=num_beams,
-                vocab_size=vocab_size,
-                encoder_outputs=encoder_outputs,
-                attention_mask=attention_mask,
-            )
-        else:
-            output = self._generate_no_beam_search(
-                input_ids,
-                cur_len=cur_len,
-                max_length=max_length,
-                min_length=min_length,
-                do_sample=do_sample,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-                bad_words_ids=bad_words_ids,
-                bos_token_id=bos_token_id,
-                pad_token_id=pad_token_id,
-                decoder_start_token_id=decoder_start_token_id,
-                eos_token_id=eos_token_id,
-                batch_size=effective_batch_size,
-                encoder_outputs=encoder_outputs,
-                attention_mask=attention_mask,
-            )
-
-        return output
-
-    def enforce_repetition_penalty_(self, lprobs, batch_size, num_beams, prev_output_tokens, repetition_penalty):
-        """repetition penalty (from CTRL paper https://arxiv.org/abs/1909.05858). """
-        for i in range(batch_size * num_beams):
-            for previous_token in set(self.prompt_inputs[i].tolist()):
-                # if score < 0 then repetition penalty has to multiplied to reduce the previous token probability
-                if lprobs[i, previous_token] < 0:
-                    lprobs[i, previous_token] *= repetition_penalty
-                else:
-                    lprobs[i, previous_token] /= repetition_penalty
-
-            if repetition_penalty < 1:
-                for previous_token in prev_output_tokens[i][len(self.prompt_inputs[i]):].tolist():
-                    # if score < 0 then repetition penalty has to multiplied to reduce the previous token probability
-                    if lprobs[i, previous_token] < 0:
-                        lprobs[i, previous_token] /= repetition_penalty
-                    else:
-                        lprobs[i, previous_token] *= repetition_penalty
-
 
 MODEL_CLASSES = {
     "gpt2": (GPT2Config, NewGPT2LMHeadModel, GPT2Tokenizer),
@@ -465,22 +161,7 @@ MODEL_CLASSES = {
     "camembert": (CamembertConfig, CamembertForMaskedLM, CamembertTokenizer),
 }
 
-
-CLS_ID, END_ID, PAD_ID = 50256, 50256, 50256
-SENTENCE_BOUNDARIES = ['.', '?', '!']
-
-def split_document_to_sentences(document):
-    sentences = []
-    sentence = []
-    document = [word for word in document.split(' ') if word != '']
-    for word in document:
-        sentence.append(word)
-        if word in SENTENCE_BOUNDARIES:
-            sentences.append(' '.join(sentence))
-            sentence = []
-    if len(sentence) > 0:
-        sentences.append(' '.join(sentence))
-    return sentences
+paraphrase_file_postfix = '.trainONmnli12000.paraphrase.1.00penalty.sample.filtered.pkl'
 
 class TextDataset(Dataset):
     def __init__(self, tokenizer: PreTrainedTokenizer, args, file_path: str, block_size=512):
@@ -492,49 +173,156 @@ class TextDataset(Dataset):
         cached_features_file = os.path.join(
             directory, args.model_type + "_cached_lm_" + str(block_size) + "_" + filename
         )
-        self.cached_features_file = cached_features_file
 
         if os.path.exists(cached_features_file) and not args.overwrite_cache:
             logger.info("Loading features from cached file %s", cached_features_file)
             with open(cached_features_file, "rb") as handle:
-                self.corpus = pickle.load(handle)
+                self.examples = pickle.load(handle)
         else:
             logger.info("Creating features from dataset file at %s", directory)
+            paraphrases_list = pickle.load(open('/home/niuyilin/ParaphraseTools/' + file_path + paraphrase_file_postfix, 'rb'))
 
-            self.corpus = []
+            self.examples = []
+            def lower_first_word(sentence):
+                sentence = [word for word in sentence.split(' ') if word != '']
+                if sentence[0] != 'I':
+                    sentence[0] = sentence[0].lower()
+                sentence = ' '.join(sentence)
+                return sentence
             with open(file_path, encoding="utf-8") as f:
+                question = None
+                options = []
+                label = -1
+                query_type = None
+                option_paraphrases = []
+                option_sample_probs = []
+                option_factors = []
                 for text in f:
                     text = text.strip()
                     if text[:3] == '<p>':
-                        sentence = text[3:-4]
-                        continue
+                        question = text[3:-4]
                     elif text[:4] in ['<a1>', '<a2>']:
-                        sentence = text[4:-5]
-                    else:
+                        options.append(lower_first_word(text[4:-5]))
+                        option_paraphrases.append(paraphrases_list[0][:100])
+                        option_sample_probs.append([option_paraphrase[1] for option_paraphrase in option_paraphrases[-1]])
+                        option_factors.append([option_paraphrase[2] for option_paraphrase in option_paraphrases[-1]])
+                        option_paraphrases[-1] = [lower_first_word(option_paraphrase[0]) for option_paraphrase in option_paraphrases[-1]]
+                        paraphrases_list = paraphrases_list[1:]
+                    elif 'most-plausible-alternative' in text:
+                        label = int(text[-3]) - 1
+                        if 'effect' in text:
+                            query_type = 'so'
+                        elif 'cause' in text:
+                            query_type = 'because'
+
+                    assert len(options) <= 2
+                    if len(options) < 2:
                         continue
 
-                    self.corpus.append(upper_first_word(sentence))
+                    # options = option_paraphrases[label] + option_paraphrases[1 - label]
+                    options = [options[label], options[1 - label]]
+                    option_factors = option_factors[label] + option_factors[1 - label]
+                    option_sample_probs = option_sample_probs[label] + option_sample_probs[1 - label]
+
+                    tokenized_question = tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s' % (question[:-1], query_type)))
+                    tokenized_options = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (question[:-1], query_type, option))) for option in options]
+
+                    if len(self.examples) < 5:
+                        print(tokenized_options)
+
+                    len_question = len(tokenized_question)
+                    new_example = {'input_ids': [], 
+                                    'labels': []}
+                    for tokenized_option in tokenized_options:
+                        new_example['input_ids'].append(torch.tensor(tokenized_option))
+                        new_example['labels'].append(torch.tensor([-100] * len_question + tokenized_option[len_question:]))                        
+
+                    self.examples.append([new_example, option_sample_probs, option_factors])
+                    option_factors = []
+                    options = []
+                    option_paraphrases = []
+                    option_sample_probs = []
+
+            # Note that we are loosing the last truncated example here for the sake of simplicity (no padding)
+            # If your dataset is small, first you should loook for a bigger one :-) and second you
+            # can change this behavior by adding (model specific) padding.
 
             logger.info("Saving features into cached file %s", cached_features_file)
             with open(cached_features_file, "wb") as handle:
-                pickle.dump(self.corpus, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(self.examples, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     def __len__(self):
-        return len(self.corpus)
+        return len(self.examples)
 
     def __getitem__(self, item):
-        return self.corpus[item]
+        return self.examples[item]
 
-    def save_corpus(self):
-        logger.info("Saving features into cached file %s", self.cached_features_file)
-        with open(self.cached_features_file, "wb") as handle:
-            pickle.dump(self.corpus, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    def save_corpus(self, tokenizer: PreTrainedTokenizer, args, file_path: str, block_size=512):
+        assert os.path.isfile(file_path)
+
+        directory, filename = os.path.split(file_path)
+
+        logger.info("Creating features from dataset file at %s", directory)
+        paraphrases_list = pickle.load(open('/home/niuyilin/ParaphraseTools/' + file_path + paraphrase_file_postfix, 'rb'))
+
+        with open(file_path, encoding="utf-8") as f:
+            with open('%s.bothGeneration.Top1' % (file_path), "w") as w:
+                label = None
+                for text in f:
+                    if text.strip()[:4] in ['<a1>', '<a2>']:
+
+                        # if text.strip()[2] != str(label):
+                        #     w.write(text)
+                        #     paraphrases_list = paraphrases_list[1:]
+                        #     continue
+
+                        text = text.strip()
+
+                        threshold = 0.005
+                        while True:
+                            new_paraphrases = sorted(filter(lambda x:x[2] > threshold, paraphrases_list[0]), key=lambda x:x[1], reverse=True)
+                            if len(new_paraphrases) >= 5:
+                                if text[4:-5] != new_paraphrases[0][0]:
+                                    w.write('%s%s%s\n' % (text[:4], new_paraphrases[0][0], text[-5:]))
+                                else:
+                                    w.write('%s%s%s\n' % (text[:4], new_paraphrases[1][0], text[-5:]))
+                                paraphrases_list = paraphrases_list[1:]
+                                break
+                            else:
+                                threshold *= 0.9
+
+                    else:
+                        if 'most-plausible-alternative' in text:
+                            label = int(text.strip()[-3])
+                        w.write(text)
+
+
+class LineByLineTextDataset(Dataset):
+    def __init__(self, tokenizer: PreTrainedTokenizer, args, file_path: str):
+        assert os.path.isfile(file_path)
+        # Here, we do not cache the features, operating under the assumption
+        # that we will soon use fast multithreaded tokenizers from the
+        # `tokenizers` repo everywhere =)
+        logger.info("Creating features from dataset file at %s", file_path)
+
+        with open(file_path, encoding="utf-8") as f:
+            lines = [line for line in f.read().splitlines() if (len(line) > 0 and not line.isspace())]
+
+        self.examples = tokenizer.batch_encode_plus(lines, add_special_tokens=True, max_length=block_size)["input_ids"]
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, i):
+        return torch.tensor(self.examples[i], dtype=torch.long)
 
 
 def load_and_cache_examples(args, tokenizer, evaluate=False):
     file_path = args.eval_data_file if evaluate else args.train_data_file
-    dataset = TextDataset(tokenizer, args, file_path=file_path, block_size=args.block_size)
-    return dataset
+    if args.line_by_line:
+        return LineByLineTextDataset(tokenizer, args, file_path=file_path, block_size=args.block_size)
+    else:
+        return TextDataset(tokenizer, args, file_path=file_path, block_size=args.block_size)
 
 
 def set_seed(args):
@@ -580,18 +368,33 @@ def _rotate_checkpoints(args, checkpoint_prefix="checkpoint", use_mtime=False) -
         logger.info("Deleting older checkpoint [{}] due to args.save_total_limit".format(checkpoint))
         shutil.rmtree(checkpoint)
 
-def collate(examples):
-    corrupted_sentences = [corrupt.corrupt(sentence, shuffle_prob=0.2, replace_prob=0.2) for sentence in examples]
-    input_ids = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s %s' % (corrupted_sentence, sep_token, sentence, end_token))) for sentence, corrupted_sentence in zip(examples, corrupted_sentences)]
-    len_corrupted_sentences = [len(tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s' % (corrupted_sentence, sep_token)))) for corrupted_sentence in corrupted_sentences]
-    labels = [torch.tensor([-100] * len_corrupted_sentence + _input_ids[len_corrupted_sentence:]) for _input_ids, len_corrupted_sentence in zip(input_ids, len_corrupted_sentences)]
-    input_ids = [torch.tensor(_input_ids) for _input_ids in input_ids]
 
+def padding_mask(attention_masks):
+    max_len = max([len(attention_mask) for attention_mask in attention_masks])
+    for i, attention_mask in enumerate(attention_masks):
+        if len(attention_mask) < max_len:
+            attention_masks[i] = torch.cat([attention_mask, torch.zeros(len(attention_mask), max_len - len(attention_mask))], dim=1)
+    return attention_masks
+
+
+def collate(examples):
+    input_ids = []
+    labels = []
+    sample_probs = []
+    factors = []
+    for (example, _sample_probs, _factors) in examples:
+        input_ids.extend(example['input_ids'])
+        labels.extend(example['labels'])
+        sample_probs.extend(_sample_probs)
+        factors.extend(_factors)
     input_ids = pad_sequence(input_ids, batch_first=True, padding_value=PAD_ID)
     labels = pad_sequence(labels, batch_first=True, padding_value=-100)
     examples = {'input_ids': input_ids.long(), 
-            'labels': labels.long()}
-    return examples
+                        'labels': labels.long()}
+    sample_probs = torch.tensor(sample_probs).float()
+    factors = torch.tensor(factors).float()
+
+    return examples, sample_probs, factors
 
 
 def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedTokenizer) -> Tuple[int, float]:
@@ -709,10 +512,16 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
                 continue
 
             batch['input_ids'] = batch['input_ids'].to(args.device)
-            batch['labels'] = batch['labels'].to(args.device)
+            batch['masked_lm_labels'] = batch['masked_lm_labels'].to(args.device)
+            batch['attention_mask'] = batch['attention_mask'].to(args.device)
             model.train()
             outputs = model(**batch)
+            # TODO: revise loss function
             loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
+
+            pos_loss = loss[::2]
+            neg_loss = loss[1::2]
+            loss = torch.relu(.5 + pos_loss - neg_loss).mean()
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -725,7 +534,10 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
             else:
                 loss.backward()
 
+            tr_pos_loss += pos_loss.mean().item()
+            tr_neg_loss += neg_loss.mean().item()
             tr_loss += loss.item()
+            tr_acc += (pos_loss < neg_loss).float().mean()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
@@ -738,16 +550,23 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
 
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
-                    tb_writer.add_scalar("loss", (tr_loss - logging_loss) / args.logging_steps, global_step)
-                    logging_loss = tr_loss
-
-                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
                     if (
                         args.local_rank == -1 and args.evaluate_during_training
                     ):  # Only evaluate when single GPU otherwise metrics may not average well
                         results = evaluate(args, model, tokenizer)
                         for key, value in results.items():
                             tb_writer.add_scalar("eval_{}".format(key), value, global_step)
+                    tb_writer.add_scalar("lr", scheduler.get_lr()[0], global_step)
+                    tb_writer.add_scalar("pos_loss", (tr_pos_loss - logging_pos_loss) / args.logging_steps, global_step)
+                    tb_writer.add_scalar("neg_loss", (tr_neg_loss - logging_neg_loss) / args.logging_steps, global_step)
+                    tb_writer.add_scalar("loss", (tr_loss - logging_loss) / args.logging_steps, global_step)
+                    tb_writer.add_scalar("acc", (tr_acc - logging_acc) / args.logging_steps, global_step)
+                    logging_pos_loss = tr_pos_loss
+                    logging_neg_loss = tr_neg_loss
+                    logging_loss = tr_loss
+                    logging_acc = tr_acc
+
+                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
                     checkpoint_prefix = "checkpoint"
                     # Save model checkpoint
                     output_dir = os.path.join(args.output_dir, "{}-{}".format(checkpoint_prefix, global_step))
@@ -780,11 +599,23 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
     return global_step, tr_loss / global_step
 
 
+def calc_distance(x, y):
+    distance = x - y
+    return -torch.sqrt((distance * distance).mean(dim=-1))
+
+
+def calc_cosine(x, y):
+    x = x / torch.sqrt((x * x).sum(dim=-1, keepdim=True))
+    y = y / torch.sqrt((y * y).sum(dim=-1, keepdim=True))
+    return (x * y).sum(dim=-1)
+
+
 def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefix="") -> Dict:
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_output_dir = args.output_dir
 
     eval_dataset = load_and_cache_examples(args, tokenizer, evaluate=True)
+    # eval_dataset.save_corpus(tokenizer, args, file_path=args.eval_data_file)
 
     if args.local_rank in [-1, 0]:
         os.makedirs(eval_output_dir, exist_ok=True)
@@ -805,291 +636,141 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
     logger.info("***** Running evaluation {} *****".format(prefix))
     logger.info("  Num examples = %d", len(eval_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
-    eval_loss = 0.0
-    nb_eval_steps = 0
     model.eval()
 
     acc = []
-    loss = []
-    pos_loss_list = []
-    neg_loss_list = []
-    for batch in tqdm(eval_dataloader, desc="Evaluating"):
-        # for batch in batchs:
+    pos_score_list = []
+    neg_score_list = []
+    pos_factor_list = []
+    neg_factor_list = []
+    generated_number = 1
+    for batch, sample_probs, factors in tqdm(eval_dataloader, desc="Evaluating"):
         batch['input_ids'] = batch['input_ids'].to(args.device)
         batch['labels'] = batch['labels'].to(args.device)
 
+        sample_probs = sample_probs.to(args.device) # [batch * generated_number]
+        factors = factors.to(args.device) # [batch * generated_number]
+
         with torch.no_grad():
-            outputs = model(**batch)
-            lm_loss = outputs[0]
-            loss.append(lm_loss.item())
-        nb_eval_steps += 1
 
-    result = {"loss": np.mean(loss)}
+            probs = torch.exp(-model(**batch)[0]) # [batch * generated_number]
+            # decoupled_probs = probs * factors / sample_probs
+            # decoupled_probs = probs * factors
+            decoupled_probs = probs
+            decoupled_probs = decoupled_probs.view(-1, generated_number).mean(dim=1)
 
+            pos_scores = decoupled_probs[::2]
+            neg_scores = decoupled_probs[1::2]
+            acc.extend((pos_scores > neg_scores).long().tolist())
+            pos_score_list.extend(pos_scores.tolist())
+            neg_score_list.extend(neg_scores.tolist())
 
-    logger.info("***** Eval results {} *****".format(prefix))
+            pos_factor_list.extend(factors[::2].tolist())
+            neg_factor_list.extend(factors[1::2].tolist())
+
+    rank_scores = [(score, 1) for score in pos_score_list] + [(score, 0) for score in neg_score_list]
+    rank_scores = sorted(rank_scores, key=lambda x: x[0], reverse=True)
+
+    result = {"acc": np.mean(acc),
+            "mean_pos_score": np.mean(pos_score_list),
+            "std_pos_score": np.std(pos_score_list),
+            "mean_pos_factor": np.mean(pos_factor_list),
+            "std_pos_factor": np.std(pos_factor_list),
+            "mean_neg_score": np.mean(neg_score_list),
+            "std_neg_score": np.std(neg_score_list),
+            "mean_neg_factor": np.mean(neg_factor_list),
+            "std_neg_factor": np.std(neg_factor_list),
+            'rank_score': np.mean([rank_score[1] for rank_score in rank_scores[:int(len(rank_scores) / 2)]])}
+
     for key in sorted(result.keys()):
         logger.info("  %s = %s", key, str(result[key]))
-    try:
-        output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
-        with open(output_eval_file, "w") as writer:
-            for key in sorted(result.keys()):
-                writer.write("%s = %s\n" % (key, str(result[key])))
-    except:
-        pass
 
     return result
 
 
-def generate(model, tokenizer, encoded_prompts, num_return_sequences=30, repetition_penalty=1., top_k=40, top_p=1):
-    '''
-    encoded_prompt: [1, docuemnt_length]
-    '''
-
-    new_texts, new_output_sequences = [], []
-    for generation_round in range(100):
-        encoded_prompt = random.choice(encoded_prompts)
-        DQ_text = tokenizer.decode(encoded_prompt[0], clean_up_tokenization_spaces=True)
-        output_sequences = model.generate(
-            input_ids=encoded_prompt,
-            max_length=5 + 2 * len(encoded_prompt[0]),
-            temperature=1.,
-            top_k=top_k,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            do_sample=True,
-            num_return_sequences=num_return_sequences,
-        )
-
-        # Remove the batch dimension when returning multiple sequences
-        if len(output_sequences.shape) > 2:
-            output_sequences.squeeze_()
-
-        texts = [tokenizer.decode(generated_sequence, clean_up_tokenization_spaces=True)[len(DQ_text) : ] for generated_sequence in output_sequences]
-        for text, generated_sequence in zip(texts, output_sequences):
-            if len(text.strip().split(' ')) < 2:
-                continue
-            if '\n' in text:
-                continue
-            elif '<|endoftext|>' in text and '.' in text[: text.find('<|endoftext|>')].strip():
-                new_texts.append(text)
-                new_output_sequences.append((generated_sequence, DQ_text))
-            elif '<|endoftext|>' not in text and '.' in text:
-                new_texts.append(text)
-                new_output_sequences.append((generated_sequence, DQ_text))
-            else:
-                continue
-
-        print(len(new_output_sequences))
-        if len(new_output_sequences) > 200:
-            break
-
-    generated_sequences = []
-    entire_texts = []
-
-    for generated_sequence_idx, (generated_sequence, DQ_text) in enumerate(new_output_sequences):
-        generated_sequence = generated_sequence.tolist()
-
-        # Decode text
-        text = tokenizer.decode(generated_sequence, clean_up_tokenization_spaces=True)
-
-        # Remove all text after the stop token
-        text = text[len(DQ_text) : ]
-
-        if '<|endoftext|>' in text:
-            explanation_text = text[: text.find('<|endoftext|>')].strip()
-        else:
-            explanation_text = text.strip()
-        # explanation_text = text[: text.find('<|endoftext|>')].strip()
-        explanation_text = text[: text.find('.') + 1].strip()
-        
-        entire_texts.append('%s %s' % (DQ_text, explanation_text))
-
-        generated_sequences.append(explanation_text)
-
-    print('Non-repetitive paraphrase number:', len(set(generated_sequences)))
-
-    return entire_texts, generated_sequences
-
-        
-
-def generate_file(args, model, tokenizer):
+def evaluate_console(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefix="") -> Dict:
     # Loop to handle MNLI double evaluation (matched, mis-matched)
-    eval_dataset = load_and_cache_examples(args, tokenizer, evaluate=True)
-
-    # Eval!
-    model.eval()
-
-    generated_sequences_list = []
-
-    for sentence in eval_dataset:
-
-        tokenized_prompts = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s' % (upper_first_word(corrupt.corrupt(sentence, save_prob=1, shuffle_prob=0, replace_prob=0)), sep_token))) for i in range(1)]
-        with torch.no_grad():
-            input_ids = [torch.tensor([tokenized_prompt]).long().to(args.device) for tokenized_prompt in tokenized_prompts]
-            entire_texts, generated_sequences = generate(model, tokenizer, input_ids, num_return_sequences=300, repetition_penalty=args.repetition_penalty)
-
-        probs = calc_probs(args, model, tokenizer, entire_texts[0][:-len(generated_sequences[0])].strip(), generated_sequences)
-
-        generated_sequences = [(upper_first_word(generated_sequence), prob) for generated_sequence, prob in zip(generated_sequences, probs)]
-        print(entire_texts[0][:-len(generated_sequences[0][0])])
-        print(generated_sequences[0])
-        print('Generated number: ', len(generated_sequences))
-        generated_sequences_list.append(generated_sequences)
-        print('%d%s' % (len(generated_sequences_list), '=' * 20))
-        assert len(set([generated_sequence[0] for generated_sequence in generated_sequences])) == len(set([generated_sequence[1] for generated_sequence in generated_sequences]))
-
-        if random.random() > 0.95:
-            pickle.dump(generated_sequences_list, open(args.eval_data_file + '.trainONmnli12000.paraphrase.%.2fpenalty.sample.pkl' % (args.repetition_penalty), 'wb'))
-
-    pickle.dump(generated_sequences_list, open(args.eval_data_file + '.trainONmnli12000.paraphrase.%.2fpenalty.sample.pkl' % (args.repetition_penalty), 'wb'))
-
-def upper_first_word(sentence):
-    sentence = [word for word in sentence.split(' ') if word != '']
-    sentence = ' '.join(sentence)
-    sentence = sentence[0].upper() + sentence[1:]
-    return sentence
-
-def lower_first_word(sentence):
-    sentence = [word for word in sentence.split(' ') if word != '']
-    if sentence[0] != 'I':
-        sentence[0] = sentence[0].lower()
-    sentence = ' '.join(sentence)
-    return sentence
-
-def calc_probs(args, model, tokenizer, prompt, paraphrases, do_upper=True):
-    batch = {'input_ids': [],
-            'labels': []}
-    tokenized_prompt = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(prompt))
-    for paraphrase in paraphrases:
-        if do_upper:
-            paraphrase = upper_first_word(paraphrase)
-        tokenized_paraphrase = tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s' % (prompt, paraphrase)))
-        batch['input_ids'].append(torch.tensor(tokenized_paraphrase))
-        batch['labels'].append(torch.tensor([-100] * len(tokenized_prompt) + tokenized_paraphrase[len(tokenized_prompt):]))
-    batch['input_ids'] = pad_sequence(batch['input_ids'], batch_first=True, padding_value=PAD_ID).long().to(args.device)
-    batch['labels'] = pad_sequence(batch['labels'], batch_first=True, padding_value=-100).long().to(args.device)
-
-    model.eval()
-    with torch.no_grad():
-        loss = model.prob_forward(**batch)[0]
-        probs = torch.exp(-loss).tolist()
-
-    return probs
-
-def calc_distance(x, y):
-    distance = x - y
-    return -torch.sqrt((distance * distance).mean(dim=-1))
-
-
-def calc_cosine(x, y):
-    x = x / torch.sqrt((x * x).sum(dim=-1, keepdim=True))
-    y = y / torch.sqrt((y * y).sum(dim=-1, keepdim=True))
-    return (x * y).sum(dim=-1)
-
-def calc_simlarities(args, model, tokenizer, query, sentences, do_upper=True):
-    model.eval()
-    with torch.no_grad():
-        batch = {'input_ids': [],
-                'attention_mask': []}
-        for sentence in [query] + sentences:
-            if do_upper:
-                sentence = upper_first_word(sentence)
-            input_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize('<s> %s </s>' % sentence))
-            batch['input_ids'].append(torch.tensor(input_ids))
-            batch['attention_mask'].append(torch.tensor([1] * len(input_ids)))
-        batch['input_ids'] = pad_sequence(batch['input_ids'], batch_first=True, padding_value=1).long().to(args.device)
-        batch['attention_mask'] = pad_sequence(batch['attention_mask'], batch_first=True, padding_value=0).float().to(args.device)
-        states = model(**batch)
-        simlarities = calc_cosine(states[0].unsqueeze(dim=0), states[1:])
-    return simlarities
-
-
-def evaluate_console(args, model, lm_model, nli_model, tokenizer, nli_tokenizer):
-    model.eval()
-    lm_model.eval()
+    cls_token, sep_token = '<s>', '</s>'
     while True:
-        context = input('Please input context:').strip()
+        context = input('Input context:')
         while True:
-            option = input('Please input option(EXIT for stop):').strip()
-            accumulate_probs = []
-            for i in range(10000):
-                tokenized_prompts = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize(context)) for i in range(1)]
-                with torch.no_grad():
-                    input_ids = [torch.tensor([tokenized_prompt]).long().to(args.device) for tokenized_prompt in tokenized_prompts]
-                    entire_texts, generated_sequences = generate(lm_model, tokenizer, input_ids, num_return_sequences=300, repetition_penalty=1, top_k=0, top_p=1)
+            option = input('Input option(EXIT for exiting):').strip()
+            if option == 'EXIT':
+                break
 
-                    # probs = calc_probs(args, lm_model, tokenizer, context, ['%s <|endoftext|>' % (generated_sequence) for generated_sequence in generated_sequences], do_upper=False)
-                    # probs = torch.tensor(probs).float().to(args.device)
+            tokenized_question_tokens = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, token, sep_token)))[1:-1] for token in context.split(' ')]
+            len_question_tokens = [len(token) for token in tokenized_question_tokens]
+            tokenized_option_tokens = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, token, sep_token)))[1:-1] for token in option.split(' ')]
+            len_option_tokens = [len(token) for token in tokenized_option_tokens]
+            assert sum(len_question_tokens) == len(tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, context, sep_token)))[1:-1])
+            tokenized_option = tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s %s' % (cls_token, context, option, sep_token)))
 
-                    # tokenized_context = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(context))
-                    # tokenized_options = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s <|endoftext|>' % (context, generated_sequence))) for generated_sequence in generated_sequences]
+            print(tokenized_option)
 
-                    # batch = {'input_ids':[],
-                    #         'labels': []}
-                    # len_context = len(tokenized_context)
-                    # for tokenized_option in tokenized_options:
-                    #     batch['input_ids'].append(torch.tensor(tokenized_option))
-                    #     batch['labels'].append(torch.tensor([-100] * len_context + tokenized_option[len_context:]))
-                    # batch['input_ids'] = pad_sequence(batch['input_ids'], batch_first=True, padding_value=PAD_ID).long().to(args.device)
-                    # batch['labels'] = pad_sequence(batch['labels'], batch_first=True, padding_value=-100).long().to(args.device)
+            batch = {'input_ids': [], 
+                            'masked_lm_labels': [],
+                            'num_samples': [len(len_option_tokens)]}
+            len_question = sum(len_question_tokens)
+            begin_token = len_question + 1
+            end_token = len(tokenized_option) - 1
+            for len_token in len_option_tokens:
+                pos_inputs = torch.tensor(tokenized_option + [])
+                pos_labels = torch.tensor([-100] * len(pos_inputs))
 
-                    # condition_probs = torch.exp(-lm_model.prob_forward(**batch)[0])
-                    # condition_probs = (condition_probs / probs).mean().item()
+                pos_labels[begin_token:begin_token + len_token] = pos_inputs[begin_token:begin_token + len_token]
+                # pos_inputs[begin_token:end_token] = MASK_ID
+                pos_inputs[begin_token:begin_token + len_token] = MASK_ID
 
-                    simlarities = calc_simlarities(args, nli_model, nli_tokenizer, option, generated_sequences, do_upper=True)
-                    condition_probs = simlarities.tolist()
+                batch['input_ids'].append(pos_inputs)
+                batch['masked_lm_labels'].append(pos_labels)
 
-                    accumulate_probs.extend(condition_probs)
+                begin_token += len_token
 
-                    print('=========Round %d==============' % (i))
-                    print('Current prob:', np.mean(condition_probs))
-                    print('Accumulated prob(mean):', np.mean(accumulate_probs))
-                    print('Accumulated prob(std):', np.std(accumulate_probs))
-                    if (i + 1) % 10 == 0:
-                        do_stop = input('Input STOP to stop.')
-                        if do_stop == 'STOP':
-                            break
+            assert begin_token == end_token
 
+            # for batch in batchs:
+            batch['input_ids'] = torch.stack(batch['input_ids'], dim=0).to(args.device)
+            batch['masked_lm_labels'] = torch.stack(batch['masked_lm_labels'], dim=0).to(args.device)
 
-# def evaluate_console0(args, model, lm_model, tokenizer):
-#     model.eval()
-#     lm_model.eval()
-#     while True:
-#         context = input('Please input context:').strip()
-#         while True:
-#             option = input('Please input option(EXIT for stop):').strip()
-#             accumulate_probs = []
-#             for i in range(10000):
-#                 tokenized_prompts = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s' % (upper_first_word(corrupt.corrupt(option, save_prob=1, shuffle_prob=0, replace_prob=0)), sep_token))) for i in range(1)]
-#                 with torch.no_grad():
-#                     input_ids = [torch.tensor([tokenized_prompt]).long().to(args.device) for tokenized_prompt in tokenized_prompts]
-#                     entire_texts, generated_sequences = generate(model, tokenizer, input_ids, num_return_sequences=300, repetition_penalty=1, top_k=0, top_p=1)
+            with torch.no_grad():
 
-#                     probs = calc_probs(args, model, tokenizer, entire_texts[0][:-len(generated_sequences[0])].strip(), ['%s <|endoftext|>' % (lower_first_word(generated_sequence)) for generated_sequence in generated_sequences], do_upper=False)
-#                     probs = torch.tensor(probs).float().to(args.device)
+                condition_prob = torch.exp(model(**batch)[0])[0].item()
+                
+            tokenized_option = tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, option, sep_token)))
 
-#                     tokenized_context = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(context))
-#                     tokenized_options = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s <|endoftext|>' % (context, lower_first_word(generated_sequence)))) for generated_sequence in generated_sequences]
+            print(tokenized_option)
 
-#                     batch = {'input_ids':[],
-#                             'labels': []}
-#                     len_context = len(tokenized_context)
-#                     for tokenized_option in tokenized_options:
-#                         batch['input_ids'].append(torch.tensor(tokenized_option))
-#                         batch['labels'].append(torch.tensor([-100] * len_context + tokenized_option[len_context:]))
-#                     batch['input_ids'] = pad_sequence(batch['input_ids'], batch_first=True, padding_value=PAD_ID).long().to(args.device)
-#                     batch['labels'] = pad_sequence(batch['labels'], batch_first=True, padding_value=-100).long().to(args.device)
+            batch = {'input_ids': [], 
+                            'masked_lm_labels': [],
+                            'num_samples': [len(len_option_tokens)]}
+            begin_token = 1
+            end_token = len(tokenized_option) - 1
+            for len_token in len_option_tokens:
+                pos_inputs = torch.tensor(tokenized_option + [])
+                pos_labels = torch.tensor([-100] * len(pos_inputs))
 
-#                     condition_probs = torch.exp(-lm_model.prob_forward(**batch)[0])
-#                     condition_probs = (condition_probs / probs).mean().item()
+                pos_labels[begin_token:begin_token + len_token] = pos_inputs[begin_token:begin_token + len_token]
+                # pos_inputs[begin_token:end_token] = MASK_ID
+                pos_inputs[begin_token:begin_token + len_token] = MASK_ID
 
-#                     accumulate_probs.append(condition_probs)
+                batch['input_ids'].append(pos_inputs)
+                batch['masked_lm_labels'].append(pos_labels)
 
-#                     print('=========Round %d==============' % (i))
-#                     print('Current prob:', condition_probs)
-#                     print('Accumulated prob(mean):', np.mean(accumulate_probs))
-#                     print('Accumulated prob(std):', np.std(accumulate_probs))
+                begin_token += len_token
+
+            assert begin_token == end_token
+
+            # for batch in batchs:
+            batch['input_ids'] = torch.stack(batch['input_ids'], dim=0).to(args.device)
+            batch['masked_lm_labels'] = torch.stack(batch['masked_lm_labels'], dim=0).to(args.device)
+
+            with torch.no_grad():
+
+                prob = torch.exp(model(**batch)[0])[0].item()
+
+            print('Condition Prob:', condition_prob)
+            print('Prob:', prob)
+            print('Mutual Info:', np.log(condition_prob / prob))
 
 
 def main():
@@ -1166,8 +847,7 @@ def main():
     )
     parser.add_argument("--do_train", action="store_true", help="Whether to run training.")
     parser.add_argument("--do_eval", action="store_true", help="Whether to run eval on the dev set.")
-    parser.add_argument("--do_eval_console", action="store_true", help="Whether to run eval on the dev set.")
-    parser.add_argument("--do_generate", action="store_true", help="Whether to run generation on the dev set.")
+    parser.add_argument("--do_eval_console", action="store_true", help="Whether to run eval_console on the dev set.")
     parser.add_argument(
         "--evaluate_during_training", action="store_true", help="Run evaluation during training at each logging step."
     )
@@ -1182,7 +862,6 @@ def main():
         default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
-    parser.add_argument("--repetition_penalty", default=1.2, type=float, help="Repetition penalty for generation.")
     parser.add_argument("--learning_rate", default=5e-5, type=float, help="The initial learning rate for Adam.")
     parser.add_argument("--weight_decay", default=0.0, type=float, help="Weight decay if we apply some.")
     parser.add_argument("--adam_epsilon", default=1e-8, type=float, help="Epsilon for Adam optimizer.")
@@ -1309,7 +988,6 @@ def main():
         torch.distributed.barrier()  # Barrier to make sure only the first process in distributed training download model & vocab
 
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    global tokenizer
 
     if args.config_name:
         config = config_class.from_pretrained(args.config_name, cache_dir=args.cache_dir)
@@ -1327,8 +1005,6 @@ def main():
             "You are instantiating a new {} tokenizer. This is not supported, but you can do it from another script, save it,"
             "and load it from here, using --tokenizer_name".format(tokenizer_class.__name__)
         )
-    if len(tokenizer) == 50257:
-        tokenizer.add_special_tokens({'additional_special_tokens': [sep_token]})
 
     if args.block_size <= 0:
         args.block_size = tokenizer.max_len
@@ -1410,7 +1086,7 @@ def main():
             result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
             results.update(result)
 
-    # Evaluation on console
+    # Evaluation
     results = {}
     if args.do_eval_console and args.local_rank in [-1, 0]:
         checkpoints = [args.output_dir]
@@ -1426,43 +1102,9 @@ def main():
 
             model = model_class.from_pretrained(checkpoint)
             model.to(args.device)
-            
-            lm_model = model_class.from_pretrained(
-                                        '/home/niuyilin/pre-trained-models/gpt2-large',
-                                        from_tf=False,
-                                        config=config,
-                                    )
-            lm_model.to(args.device)
-            
-            nli_config = RobertaConfig.from_pretrained('/home/niuyilin/pre-trained-models/sentence-robert-large-nli-mean-tokens/0_RoBERTa')
-            nli_tokenizer = RobertaTokenizer.from_pretrained('/home/niuyilin/pre-trained-models/sentence-robert-large-nli-mean-tokens/0_RoBERTa')
-            nli_model = NewRobertaForMaskedLM.from_pretrained(
-                                        '/home/niuyilin/pre-trained-models/sentence-robert-large-nli-mean-tokens/0_RoBERTa',
-                                        from_tf=False,
-                                        config=nli_config,
-                                    )
-            nli_model.to(args.device)
-
-            result = evaluate_console(args, model, lm_model, nli_model, tokenizer, nli_tokenizer)
+            result = evaluate_console(args, model, tokenizer, prefix=prefix)
             result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
             results.update(result)
-
-    # Generation
-    if args.do_generate and args.local_rank in [-1, 0]:
-        checkpoints = [args.output_dir]
-        if args.eval_all_checkpoints:
-            checkpoints = list(
-                os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + "/**/" + WEIGHTS_NAME, recursive=True))
-            )
-            logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
-        logger.info("Evaluate the following checkpoints: %s", checkpoints)
-        for checkpoint in checkpoints:
-            global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
-            prefix = checkpoint.split("/")[-1] if checkpoint.find("checkpoint") != -1 else ""
-
-            model = model_class.from_pretrained(checkpoint)
-            model.to(args.device)
-            generate_file(args, model, tokenizer)
 
     return results
 
