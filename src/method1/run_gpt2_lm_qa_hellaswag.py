@@ -175,7 +175,7 @@ class NewGPT2LMHeadModel(GPT2LMHeadModel):
 
         outputs = (lm_logits,) + transformer_outputs[1:]
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='sum')
             loss = []
             for lm_logit, label in zip(lm_logits, labels):
                 # Shift so that tokens < n predict n
@@ -503,18 +503,25 @@ class TextDataset(Dataset):
 
             self.corpus = []
             with open(file_path, encoding="utf-8") as f:
-                for text in f:
-                    text = text.strip()
-                    if text[:3] == '<p>':
-                        sentence = text[3:-4]
-                        continue
-                    elif text[:4] in ['<a1>', '<a2>']:
-                        sentence = text[4:-5]
-                    else:
-                        continue
+                with open(file_path[:-6] + '-labels.lst', encoding="utf-8") as f_label:
 
-                    self.corpus.append(upper_first_word(sentence))
+                    for text, label in zip(f, f_label):
 
+                        label = int(label.strip())
+
+                        item = json.loads(text)
+                        ctx_a = item['ctx_a'].strip()
+                        ctx_b = item['ctx_b'].strip()
+                        
+                        try:
+                            ctx_b = ctx_b[0].upper() + ctx_b[1:]
+                            sentence = ctx_a + ' ' + ctx_b
+
+                            self.corpus.append(sentence)
+                        except:
+                            print(ctx_a)
+                            print(ctx_b)
+                            
             logger.info("Saving features into cached file %s", cached_features_file)
             with open(cached_features_file, "wb") as handle:
                 pickle.dump(self.corpus, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -852,7 +859,7 @@ def generate(model, tokenizer, encoded_prompts, num_return_sequences=30, repetit
         DQ_text = tokenizer.decode(encoded_prompt[0], clean_up_tokenization_spaces=True)
         output_sequences = model.generate(
             input_ids=encoded_prompt,
-            max_length=5 + 2 * len(encoded_prompt[0]),
+            max_length=15 + len(encoded_prompt[0]),
             temperature=1.,
             top_k=top_k,
             top_p=top_p,
@@ -881,7 +888,7 @@ def generate(model, tokenizer, encoded_prompts, num_return_sequences=30, repetit
                 continue
 
         print(len(new_output_sequences))
-        if len(new_output_sequences) > 2000:
+        if len(new_output_sequences) > 200:
             break
 
     generated_sequences = []
@@ -924,25 +931,21 @@ def generate_file(args, model, tokenizer):
 
     for sentence in eval_dataset:
 
-        tokenized_prompts = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s' % (upper_first_word(corrupt.corrupt(sentence, save_prob=1, shuffle_prob=0, replace_prob=0)), sep_token))) for i in range(1)]
+        tokenized_prompts = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize(sentence)) for i in range(1)]
         with torch.no_grad():
             input_ids = [torch.tensor([tokenized_prompt]).long().to(args.device) for tokenized_prompt in tokenized_prompts]
-            entire_texts, generated_sequences = generate(model, tokenizer, input_ids, num_return_sequences=300, repetition_penalty=args.repetition_penalty)
+            entire_texts, generated_sequences = generate(model, tokenizer, input_ids, num_return_sequences=200, repetition_penalty=args.repetition_penalty, top_k=0, top_p=1)
 
-        probs = calc_probs(args, model, tokenizer, entire_texts[0][:-len(generated_sequences[0])].strip(), generated_sequences)
-
-        generated_sequences = [(upper_first_word(generated_sequence), prob) for generated_sequence, prob in zip(generated_sequences, probs)]
-        print(entire_texts[0][:-len(generated_sequences[0][0])])
+        print(entire_texts[0][:-len(generated_sequences[0])])
         print(generated_sequences[0])
         print('Generated number: ', len(generated_sequences))
         generated_sequences_list.append(generated_sequences)
         print('%d%s' % (len(generated_sequences_list), '=' * 20))
-        assert len(set([generated_sequence[0] for generated_sequence in generated_sequences])) == len(set([generated_sequence[1] for generated_sequence in generated_sequences]))
 
         if random.random() > 0.95:
-            pickle.dump(generated_sequences_list, open(args.eval_data_file + '.trainONmnli12000.paraphrase.%.2fpenalty.sample.pkl' % (args.repetition_penalty), 'wb'))
+            pickle.dump(generated_sequences_list, open(args.eval_data_file + '.gpt2large.qa.%.2fpenalty.sample.pkl' % (args.repetition_penalty), 'wb'))
 
-    pickle.dump(generated_sequences_list, open(args.eval_data_file + '.trainONmnli12000.paraphrase.%.2fpenalty.sample.pkl' % (args.repetition_penalty), 'wb'))
+    pickle.dump(generated_sequences_list, open(args.eval_data_file + '.gpt2large.qa.%.2fpenalty.sample.pkl' % (args.repetition_penalty), 'wb'))
 
 def upper_first_word(sentence):
     sentence = [word for word in sentence.split(' ') if word != '']
@@ -1010,20 +1013,46 @@ def evaluate_console(args, model, lm_model, nli_model, tokenizer, nli_tokenizer)
     lm_model.eval()
     while True:
         context = input('Please input context:').strip()
-        tokenized_prompts = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize(context)) for i in range(1)]
-        with torch.no_grad():
-            input_ids = [torch.tensor([tokenized_prompt]).long().to(args.device) for tokenized_prompt in tokenized_prompts]
-            entire_texts, generated_sequences = generate(lm_model, tokenizer, input_ids, num_return_sequences=300, repetition_penalty=1, top_k=0, top_p=1)
         while True:
             option = input('Please input option(EXIT for stop):').strip()
-            with torch.no_grad():
-                simlarities = calc_simlarities(args, nli_model, nli_tokenizer, option, generated_sequences, do_upper=True)
-                condition_prob = torch.relu(torch.exp((simlarities - 0.65) * 5.) - 1.).mean()
+            accumulate_probs = []
+            for i in range(10000):
+                tokenized_prompts = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize(context)) for i in range(1)]
+                with torch.no_grad():
+                    input_ids = [torch.tensor([tokenized_prompt]).long().to(args.device) for tokenized_prompt in tokenized_prompts]
+                    entire_texts, generated_sequences = generate(lm_model, tokenizer, input_ids, num_return_sequences=300, repetition_penalty=1, top_k=0, top_p=1)
 
-                print('Voted prob:', condition_prob.item())
+                    # probs = calc_probs(args, lm_model, tokenizer, context, ['%s <|endoftext|>' % (generated_sequence) for generated_sequence in generated_sequences], do_upper=False)
+                    # probs = torch.tensor(probs).float().to(args.device)
 
-                prob = calc_probs(args, lm_model, tokenizer, context, ['%s <|endoftext|>' % (lower_first_word(option))], do_upper=False)
-                print('Generated prob:', prob[0])
+                    # tokenized_context = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(context))
+                    # tokenized_options = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s <|endoftext|>' % (context, generated_sequence))) for generated_sequence in generated_sequences]
+
+                    # batch = {'input_ids':[],
+                    #         'labels': []}
+                    # len_context = len(tokenized_context)
+                    # for tokenized_option in tokenized_options:
+                    #     batch['input_ids'].append(torch.tensor(tokenized_option))
+                    #     batch['labels'].append(torch.tensor([-100] * len_context + tokenized_option[len_context:]))
+                    # batch['input_ids'] = pad_sequence(batch['input_ids'], batch_first=True, padding_value=PAD_ID).long().to(args.device)
+                    # batch['labels'] = pad_sequence(batch['labels'], batch_first=True, padding_value=-100).long().to(args.device)
+
+                    # condition_probs = torch.exp(-lm_model.prob_forward(**batch)[0])
+                    # condition_probs = (condition_probs / probs).mean().item()
+
+                    simlarities = calc_simlarities(args, nli_model, nli_tokenizer, option, generated_sequences, do_upper=True)
+                    condition_probs = simlarities.tolist()
+
+                    accumulate_probs.extend(condition_probs)
+
+                    print('=========Round %d==============' % (i))
+                    print('Current prob:', np.mean(condition_probs))
+                    print('Accumulated prob(mean):', np.mean(accumulate_probs))
+                    print('Accumulated prob(std):', np.std(accumulate_probs))
+                    if (i + 1) % 10 == 0:
+                        do_stop = input('Input STOP to stop.')
+                        if do_stop == 'STOP':
+                            break
 
 
 # def evaluate_console0(args, model, lm_model, tokenizer):

@@ -28,6 +28,7 @@ import pickle
 import random
 import re
 import shutil
+import json
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -71,62 +72,96 @@ try:
 except ImportError:
     from tensorboardX import SummaryWriter
 
-from sentence_transformers import SentenceTransformer, util
-
-
 logger = logging.getLogger(__name__)
 
-CLS_ID, END_ID, PAD_ID, MASK_ID = 0, 2, 1, 3
+END_ID, PAD_ID = 50256, 50256
 
-class NewRobertaForMaskedLM(RobertaForMaskedLM):
-    
+class NewGPT2LMHeadModel(GPT2LMHeadModel):
+
     def forward(
         self,
         input_ids=None,
+        past=None,
         attention_mask=None,
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
-        masked_lm_labels=None,
-        num_samples=None,
-        log_factors=None
+        labels=None,
     ):
-        outputs = self.roberta(
+        r"""
+        labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`, defaults to :obj:`None`):
+            Labels for language modeling.
+            Note that the labels **are shifted** inside the model, i.e. you can set ``lm_labels = input_ids``
+            Indices are selected in ``[-100, 0, ..., config.vocab_size]``
+            All labels set to ``-100`` are ignored (masked), the loss is only
+            computed for labels in ``[0, ..., config.vocab_size]``
+    Return:
+        :obj:`tuple(torch.FloatTensor)` comprising various elements depending on the configuration (:class:`~transformers.GPT2Config`) and inputs:
+        loss (:obj:`torch.FloatTensor` of shape `(1,)`, `optional`, returned when ``labels`` is provided)
+            Language modeling loss.
+        prediction_scores (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        past (:obj:`List[torch.FloatTensor]` of length :obj:`config.n_layers` with each tensor of shape :obj:`(2, batch_size, num_heads, sequence_length, embed_size_per_head)`):
+            Contains pre-computed hidden-states (key and values in the attention blocks).
+            Can be used (see `past` input) to speed up sequential decoding. The token ids which have their past given to this model
+            should not be passed as input ids as they have already been computed.
+        hidden_states (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``config.output_hidden_states=True``):
+            Tuple of :obj:`torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer)
+            of shape :obj:`(batch_size, sequence_length, hidden_size)`.
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        attentions (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``config.output_attentions=True``):
+            Tuple of :obj:`torch.FloatTensor` (one for each layer) of shape
+            :obj:`(batch_size, num_heads, sequence_length, sequence_length)`.
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    Examples::
+        import torch
+        from transformers import GPT2Tokenizer, GPT2LMHeadModel
+        tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+        model = GPT2LMHeadModel.from_pretrained('gpt2')
+        input_ids = torch.tensor(tokenizer.encode("Hello, my dog is cute", add_special_tokens=True)).unsqueeze(0)  # Batch size 1
+        outputs = model(input_ids, labels=input_ids)
+        loss, logits = outputs[:2]
+        """
+        transformer_outputs = self.transformer(
             input_ids,
+            past=past,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
         )
-        sequence_output = outputs[0] # [batch, seq_length, hidden_size]
-        
-        mean_state = []
-        for _sequence_output, _attention_mask in zip(sequence_output, attention_mask):
-            seq_length = int(_attention_mask.sum().item()) - 2
-            mean_state.append(_sequence_output[1:seq_length + 1].mean(dim=0))
-        mean_state = torch.stack(mean_state, dim=0) # [batch, hidden_size]
+        hidden_states = transformer_outputs[0]
 
-        return mean_state
+        lm_logits = self.lm_head(hidden_states)
+
+        outputs = (lm_logits,) + transformer_outputs[1:]
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
+            loss = []
+            for lm_logit, label in zip(lm_logits, labels):
+                # Shift so that tokens < n predict n
+                shift_logit = lm_logit[:-1, :]
+                shift_label = label[1:]
+                # Flatten the tokens
+                loss.append(loss_fct(shift_logit, shift_label))
+            outputs = (torch.stack(loss, dim=0),) + outputs
+
+        return outputs  # (loss), lm_logits, presents, (all hidden_states), (attentions)
 
 
 MODEL_CLASSES = {
-    "gpt2": (GPT2Config, GPT2LMHeadModel, GPT2Tokenizer),
+    "gpt2": (GPT2Config, NewGPT2LMHeadModel, GPT2Tokenizer),
     "openai-gpt": (OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer),
     "bert": (BertConfig, BertForMaskedLM, BertTokenizer),
-    "roberta": (RobertaConfig, NewRobertaForMaskedLM, RobertaTokenizer),
+    "roberta": (RobertaConfig, RobertaForMaskedLM, RobertaTokenizer),
     "distilbert": (DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer),
     "camembert": (CamembertConfig, CamembertForMaskedLM, CamembertTokenizer),
 }
 
-generation_file_postfix = 'gpt2large.qa.1.00penalty.sample'
-
-def upper_first_word(sentence):
-    sentence = [word for word in sentence.split(' ') if word != '']
-    sentence = ' '.join(sentence)
-    sentence = sentence[0].upper() + sentence[1:]
-    return sentence
+paraphrase_file_postfix = '.trainONmnli12000.paraphrase.1.00penalty.sample.filtered.pkl'
 
 class TextDataset(Dataset):
     def __init__(self, tokenizer: PreTrainedTokenizer, args, file_path: str, block_size=512):
@@ -135,51 +170,62 @@ class TextDataset(Dataset):
         block_size = block_size - (tokenizer.max_len - tokenizer.max_len_single_sentence)
 
         directory, filename = os.path.split(file_path)
+        cached_features_file = os.path.join(
+            directory, args.model_type + "_cached_lm_" + str(block_size) + "_" + filename
+        )
 
         logger.info("Creating features from dataset file at %s", directory)
-        paraphrases = pickle.load(open('%s.%s.pkl' % (file_path, generation_file_postfix), 'rb'))
-        for i, paraphrase in enumerate(paraphrases):
-            paraphrases[i] = [upper_first_word(_paraphrase) for _paraphrase in paraphrase[:50]]
-
-        cls_token, end_token = '<s>', '</s>'
+        # paraphrases_list = pickle.load(open('/home/niuyilin/ParaphraseTools/' + file_path + paraphrase_file_postfix, 'rb'))
 
         self.examples = []
         with open(file_path, encoding="utf-8") as f:
-            options = []
-            label = None
-            for text in f:
-                text = text.strip()
-                if text[:4] in ['<a1>', '<a2>']:
-                    sentence = upper_first_word(text[4:-5].strip())
-                elif 'most-plausible-alternative' in text:
-                    label = int(text[-3]) - 1
-                    continue
-                else:
-                    continue
+            with open(file_path[:-6] + '-labels.lst', encoding="utf-8") as f_label:
 
-                options.append(sentence)
-                assert len(options) <= 2
-                if len(options) < 2:
-                    continue
-                options = [options[label], options[1 - label]]
+                for text, label in zip(f, f_label):
 
-                # tokenized_paraphrases = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, paraphrase, end_token))) for paraphrase in options + paraphrases[0]]
-                current_paraphrases = paraphrases[0]
-                paraphrases = paraphrases[1:]
+                    label = int(label.strip())
 
-                # input_ids = [torch.tensor(_input_ids) for _input_ids in tokenized_paraphrases]
-                # attention_mask = [torch.tensor([1] * len(_input_ids)) for _input_ids in input_ids]
+                    try:
+                        item = json.loads(text)
+                    except:
+                        print('load error:', text)
+                        # input()
+                        continue
+                    ctx_a = item['ctx_a'].strip()
+                    ctx_b = item['ctx_b'].strip()
+                    if 'ending_options' in item:
+                        options = item['ending_options']
+                    else:
+                        options = item['endings']
+                    options = [option.strip() for option in options]
+                    options = [options[label]] + options[:label] + options[label + 1:]
 
-                # example = {'input_ids': input_ids,
-                #             'attention_mask': attention_mask,
-                #             'num_paraphrases': len(input_ids) - 2,
-                #             'paraphrases': current_paraphrases}
-                example = {'num_paraphrases': len(current_paraphrases),
-                            'paraphrases': options + current_paraphrases}
+                    try:
+                        ctx_b = ctx_b[0].upper() + ctx_b[1:]
+                        ctx = ctx_a + ' ' + ctx_b
 
-                self.examples.append(example)
+                        tokenized_question = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(ctx))
+                        tokenized_options = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s' % (ctx, option))) for option in options]
 
-                options = []
+                        if len(self.examples) < 5:
+                            print(tokenized_options)
+
+                        len_question = len(tokenized_question)
+                        new_example = {'input_ids': [], 
+                                        'labels': []}
+                        for tokenized_option in tokenized_options:
+                            new_example['input_ids'].append(torch.tensor(tokenized_option))
+                            new_example['labels'].append(torch.tensor([-100] * len_question + tokenized_option[len_question:]))                        
+
+                        self.examples.append(new_example)
+
+                        # if len(self.examples) == 545:
+                            # break
+                    except:
+                        print(ctx_a)
+                        print(ctx_b)
+
+        assert len(self.examples) == 3243
 
     def __len__(self):
         return len(self.examples)
@@ -187,9 +233,48 @@ class TextDataset(Dataset):
     def __getitem__(self, item):
         return self.examples[item]
 
+    def save_corpus(self, tokenizer: PreTrainedTokenizer, args, file_path: str, block_size=512):
+        assert os.path.isfile(file_path)
+
+        directory, filename = os.path.split(file_path)
+
+        logger.info("Creating features from dataset file at %s", directory)
+        paraphrases_list = pickle.load(open('/home/niuyilin/ParaphraseTools/' + file_path + paraphrase_file_postfix, 'rb'))
+
+        with open(file_path, encoding="utf-8") as f:
+            with open('%s.bothGeneration.Top1' % (file_path), "w") as w:
+                label = None
+                for text in f:
+                    if text.strip()[:4] in ['<a1>', '<a2>']:
+
+                        # if text.strip()[2] != str(label):
+                        #     w.write(text)
+                        #     paraphrases_list = paraphrases_list[1:]
+                        #     continue
+
+                        text = text.strip()
+
+                        threshold = 0.005
+                        while True:
+                            new_paraphrases = sorted(filter(lambda x:x[2] > threshold, paraphrases_list[0]), key=lambda x:x[1], reverse=True)
+                            if len(new_paraphrases) >= 5:
+                                if text[4:-5] != new_paraphrases[0][0]:
+                                    w.write('%s%s%s\n' % (text[:4], new_paraphrases[0][0], text[-5:]))
+                                else:
+                                    w.write('%s%s%s\n' % (text[:4], new_paraphrases[1][0], text[-5:]))
+                                paraphrases_list = paraphrases_list[1:]
+                                break
+                            else:
+                                threshold *= 0.9
+
+                    else:
+                        if 'most-plausible-alternative' in text:
+                            label = int(text.strip()[-3])
+                        w.write(text)
+
 
 class LineByLineTextDataset(Dataset):
-    def __init__(self, tokenizer: PreTrainedTokenizer, args, file_path: str, block_size=512):
+    def __init__(self, tokenizer: PreTrainedTokenizer, args, file_path: str):
         assert os.path.isfile(file_path)
         # Here, we do not cache the features, operating under the assumption
         # that we will soon use fast multithreaded tokenizers from the
@@ -260,14 +345,26 @@ def _rotate_checkpoints(args, checkpoint_prefix="checkpoint", use_mtime=False) -
         shutil.rmtree(checkpoint)
 
 
-def collate(examples):
-    num_paraphrases = []
-    paraphrases = []
-    for example in examples:
-        num_paraphrases.append(example['num_paraphrases'])
-        paraphrases.extend(example['paraphrases'])
+def padding_mask(attention_masks):
+    max_len = max([len(attention_mask) for attention_mask in attention_masks])
+    for i, attention_mask in enumerate(attention_masks):
+        if len(attention_mask) < max_len:
+            attention_masks[i] = torch.cat([attention_mask, torch.zeros(len(attention_mask), max_len - len(attention_mask))], dim=1)
+    return attention_masks
 
-    return num_paraphrases, paraphrases
+
+def collate(examples):
+    input_ids = []
+    labels = []
+    for example in examples:
+        input_ids.extend(example['input_ids'])
+        labels.extend(example['labels'])
+    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=PAD_ID)
+    labels = pad_sequence(labels, batch_first=True, padding_value=-100)
+    examples = {'input_ids': input_ids.long(), 
+                        'labels': labels.long()}
+
+    return examples
 
 
 def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedTokenizer) -> Tuple[int, float]:
@@ -488,6 +585,7 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
     eval_output_dir = args.output_dir
 
     eval_dataset = load_and_cache_examples(args, tokenizer, evaluate=True)
+    # eval_dataset.save_corpus(tokenizer, args, file_path=args.eval_data_file)
 
     if args.local_rank in [-1, 0]:
         os.makedirs(eval_output_dir, exist_ok=True)
@@ -511,62 +609,36 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
     model.eval()
 
     acc = []
-    pos_score_list = []
-    neg_score_list = []
-    pos_factor_list = []
-    neg_factor_list = []
-
-    acc = []
-    embedder = SentenceTransformer('/home/niuyilin/pre-trained-models/sentence-robert-large-nli-mean-tokens', device=args.device)
-    def logging_info(scores, paraphrases):
-        scores = scores.tolist()
-        total_num = len(scores)
-        for i in range(10):
-            pre_bank, post_bank = i * 0.1, (i + 1) * 0.1
-            range_num = sum([1. if score > pre_bank and score <= post_bank else 0. for score in scores])
-            print('\t(%.2f, %.2f): %d(%f)' % (pre_bank, post_bank, range_num, range_num / total_num))
-            if range_num > 0:
-                for score, paraphrase in zip(scores, paraphrases):
-                    if score > pre_bank and score <= post_bank:
-                        print('Example(%f): %s' % (score, paraphrase))
-                        break
-    def scale_scores(scores):
-        # return torch.relu(scores - 0.65) / 0.35
-
-        # scores = scores - 0.65
-        # return torch.relu(torch.exp(scores * 5) - 1.)
-
-        return torch.exp(5 * scores)
-    all_scores = []
-    for num_paraphrases, paraphrases in tqdm(eval_dataloader, desc="Evaluating"):
-        # batch['input_ids'] = batch['input_ids'].to(args.device)
-        # batch['attention_mask'] = batch['attention_mask'].to(args.device)
+    pos_score_list, neg_score_list = [], []
+    generated_number = 1
+    for batch in tqdm(eval_dataloader, desc="Evaluating"):
+        batch['input_ids'] = batch['input_ids'].to(args.device)
+        batch['labels'] = batch['labels'].to(args.device)
 
         with torch.no_grad():
-            # h_cls = model(**batch) # [batch, hidden_size]
-            paraphrase_embeddings = embedder.encode(paraphrases, convert_to_tensor=True)
 
-            # mean_state = h_cls.mean(dim=0).unsqueeze(dim=0)
-            # h_cls = h_cls - mean_state
+            probs = torch.exp(-model(**batch)[0]) # [batch * generated_number]
+            # decoupled_probs = probs * factors / sample_probs
+            # decoupled_probs = probs * factors
+            decoupled_probs = probs
+            decoupled_probs = decoupled_probs.view(-1, 4, generated_number).mean(dim=2)
 
-            pos_scores = scale_scores(util.pytorch_cos_sim(paraphrase_embeddings[0], paraphrase_embeddings[2:])[0])
-            neg_scores = scale_scores(util.pytorch_cos_sim(paraphrase_embeddings[1], paraphrase_embeddings[2:])[0])
-            acc.append(float(pos_scores.mean().item() > neg_scores.mean().item()))
-            all_scores.extend([pos_scores.mean().item(), neg_scores.mean().item()])
+            pos_scores = decoupled_probs[:, 0]
+            neg_scores = decoupled_probs[:, 1:]
+            acc.extend((pos_scores > torch.max(neg_scores, dim=1)[0]).long().tolist())
+            pos_score_list.extend(pos_scores.tolist())
+            neg_score_list.extend(neg_scores.view(-1).tolist())
 
-            print('============Example %d: accumulated accuracy is %f=============' % (len(acc), np.mean(acc)))
-            if acc[-1] > 0:
-                print('Right prediction!')
-            else:
-                print('Wrong prediction!')
-            print('Positive score:', pos_scores.mean().item())
-            print('Negative score:', neg_scores.mean().item())
-            print('Positive option:', paraphrases[0])
-            logging_info(pos_scores, paraphrases[2:])
-            print('Negative option:', paraphrases[1])
-            logging_info(neg_scores, paraphrases[2:])
+    rank_scores = [(score, 1) for score in pos_score_list] + [(score, 0) for score in neg_score_list]
+    rank_scores = sorted(rank_scores, key=lambda x: x[0], reverse=True)
+    all_scores = pos_score_list + neg_score_list
 
     result = {"acc": np.mean(acc),
+            "mean_pos_score": np.mean(pos_score_list),
+            "std_pos_score": np.std(pos_score_list),
+            "mean_neg_score": np.mean(neg_score_list),
+            "std_neg_score": np.std(neg_score_list),
+            'rank_score': np.mean([rank_score[1] for rank_score in rank_scores[:int(len(rank_scores) / 4)]]),
             "Max score": max(all_scores),
             "Min score": min(all_scores),
             "Mean score": np.mean(all_scores),
@@ -576,6 +648,91 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
         logger.info("  %s = %s", key, str(result[key]))
 
     return result
+
+
+def evaluate_console(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefix="") -> Dict:
+    # Loop to handle MNLI double evaluation (matched, mis-matched)
+    cls_token, sep_token = '<s>', '</s>'
+    while True:
+        context = input('Input context:')
+        while True:
+            option = input('Input option(EXIT for exiting):').strip()
+            if option == 'EXIT':
+                break
+
+            tokenized_question_tokens = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, token, sep_token)))[1:-1] for token in context.split(' ')]
+            len_question_tokens = [len(token) for token in tokenized_question_tokens]
+            tokenized_option_tokens = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, token, sep_token)))[1:-1] for token in option.split(' ')]
+            len_option_tokens = [len(token) for token in tokenized_option_tokens]
+            assert sum(len_question_tokens) == len(tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, context, sep_token)))[1:-1])
+            tokenized_option = tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s %s' % (cls_token, context, option, sep_token)))
+
+            print(tokenized_option)
+
+            batch = {'input_ids': [], 
+                            'masked_lm_labels': [],
+                            'num_samples': [len(len_option_tokens)]}
+            len_question = sum(len_question_tokens)
+            begin_token = len_question + 1
+            end_token = len(tokenized_option) - 1
+            for len_token in len_option_tokens:
+                pos_inputs = torch.tensor(tokenized_option + [])
+                pos_labels = torch.tensor([-100] * len(pos_inputs))
+
+                pos_labels[begin_token:begin_token + len_token] = pos_inputs[begin_token:begin_token + len_token]
+                # pos_inputs[begin_token:end_token] = MASK_ID
+                pos_inputs[begin_token:begin_token + len_token] = MASK_ID
+
+                batch['input_ids'].append(pos_inputs)
+                batch['masked_lm_labels'].append(pos_labels)
+
+                begin_token += len_token
+
+            assert begin_token == end_token
+
+            # for batch in batchs:
+            batch['input_ids'] = torch.stack(batch['input_ids'], dim=0).to(args.device)
+            batch['masked_lm_labels'] = torch.stack(batch['masked_lm_labels'], dim=0).to(args.device)
+
+            with torch.no_grad():
+
+                condition_prob = torch.exp(model(**batch)[0])[0].item()
+                
+            tokenized_option = tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, option, sep_token)))
+
+            print(tokenized_option)
+
+            batch = {'input_ids': [], 
+                            'masked_lm_labels': [],
+                            'num_samples': [len(len_option_tokens)]}
+            begin_token = 1
+            end_token = len(tokenized_option) - 1
+            for len_token in len_option_tokens:
+                pos_inputs = torch.tensor(tokenized_option + [])
+                pos_labels = torch.tensor([-100] * len(pos_inputs))
+
+                pos_labels[begin_token:begin_token + len_token] = pos_inputs[begin_token:begin_token + len_token]
+                # pos_inputs[begin_token:end_token] = MASK_ID
+                pos_inputs[begin_token:begin_token + len_token] = MASK_ID
+
+                batch['input_ids'].append(pos_inputs)
+                batch['masked_lm_labels'].append(pos_labels)
+
+                begin_token += len_token
+
+            assert begin_token == end_token
+
+            # for batch in batchs:
+            batch['input_ids'] = torch.stack(batch['input_ids'], dim=0).to(args.device)
+            batch['masked_lm_labels'] = torch.stack(batch['masked_lm_labels'], dim=0).to(args.device)
+
+            with torch.no_grad():
+
+                prob = torch.exp(model(**batch)[0])[0].item()
+
+            print('Condition Prob:', condition_prob)
+            print('Prob:', prob)
+            print('Mutual Info:', np.log(condition_prob / prob))
 
 
 def main():
@@ -652,6 +809,7 @@ def main():
     )
     parser.add_argument("--do_train", action="store_true", help="Whether to run training.")
     parser.add_argument("--do_eval", action="store_true", help="Whether to run eval on the dev set.")
+    parser.add_argument("--do_eval_console", action="store_true", help="Whether to run eval_console on the dev set.")
     parser.add_argument(
         "--evaluate_during_training", action="store_true", help="Run evaluation during training at each logging step."
     )
@@ -887,6 +1045,26 @@ def main():
             model = model_class.from_pretrained(checkpoint)
             model.to(args.device)
             result = evaluate(args, model, tokenizer, prefix=prefix)
+            result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
+            results.update(result)
+
+    # Evaluation
+    results = {}
+    if args.do_eval_console and args.local_rank in [-1, 0]:
+        checkpoints = [args.output_dir]
+        if args.eval_all_checkpoints:
+            checkpoints = list(
+                os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + "/**/" + WEIGHTS_NAME, recursive=True))
+            )
+            logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
+        logger.info("Evaluate the following checkpoints: %s", checkpoints)
+        for checkpoint in checkpoints:
+            global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
+            prefix = checkpoint.split("/")[-1] if checkpoint.find("checkpoint") != -1 else ""
+
+            model = model_class.from_pretrained(checkpoint)
+            model.to(args.device)
+            result = evaluate_console(args, model, tokenizer, prefix=prefix)
             result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
             results.update(result)
 

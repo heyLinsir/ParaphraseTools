@@ -139,7 +139,7 @@ class NewGPT2LMHeadModel(GPT2LMHeadModel):
 
         outputs = (lm_logits,) + transformer_outputs[1:]
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='sum')
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
             loss = []
             for lm_logit, label in zip(lm_logits, labels):
                 # Shift so that tokens < n predict n
@@ -670,6 +670,7 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
 
     rank_scores = [(score, 1) for score in pos_score_list] + [(score, 0) for score in neg_score_list]
     rank_scores = sorted(rank_scores, key=lambda x: x[0], reverse=True)
+    all_scores = pos_score_list + neg_score_list
 
     result = {"acc": np.mean(acc),
             "mean_pos_score": np.mean(pos_score_list),
@@ -680,7 +681,11 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
             "std_neg_score": np.std(neg_score_list),
             "mean_neg_factor": np.mean(neg_factor_list),
             "std_neg_factor": np.std(neg_factor_list),
-            'rank_score': np.mean([rank_score[1] for rank_score in rank_scores[:int(len(rank_scores) / 2)]])}
+            'rank_score': np.mean([rank_score[1] for rank_score in rank_scores[:int(len(rank_scores) / 2)]]),
+            "Max score": max(all_scores),
+            "Min score": min(all_scores),
+            "Mean score": np.mean(all_scores),
+            "Std score": np.std(all_scores)}
 
     for key in sorted(result.keys()):
         logger.info("  %s = %s", key, str(result[key]))

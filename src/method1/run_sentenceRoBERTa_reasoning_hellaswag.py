@@ -27,6 +27,7 @@ import os
 import pickle
 import random
 import re
+import json
 import shutil
 from typing import Dict, List, Tuple
 
@@ -138,48 +139,49 @@ class TextDataset(Dataset):
 
         logger.info("Creating features from dataset file at %s", directory)
         paraphrases = pickle.load(open('%s.%s.pkl' % (file_path, generation_file_postfix), 'rb'))
-        for i, paraphrase in enumerate(paraphrases):
-            paraphrases[i] = [upper_first_word(_paraphrase) for _paraphrase in paraphrase[:50]]
 
         cls_token, end_token = '<s>', '</s>'
 
         self.examples = []
         with open(file_path, encoding="utf-8") as f:
-            options = []
-            label = None
-            for text in f:
-                text = text.strip()
-                if text[:4] in ['<a1>', '<a2>']:
-                    sentence = upper_first_word(text[4:-5].strip())
-                elif 'most-plausible-alternative' in text:
-                    label = int(text[-3]) - 1
-                    continue
-                else:
-                    continue
+            with open(file_path[:-6] + '-labels.lst', encoding="utf-8") as f_label:
 
-                options.append(sentence)
-                assert len(options) <= 2
-                if len(options) < 2:
-                    continue
-                options = [options[label], options[1 - label]]
+                for text, label in zip(f, f_label):
 
-                # tokenized_paraphrases = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize('%s %s %s' % (cls_token, paraphrase, end_token))) for paraphrase in options + paraphrases[0]]
-                current_paraphrases = paraphrases[0]
-                paraphrases = paraphrases[1:]
+                    label = int(label.strip())
 
-                # input_ids = [torch.tensor(_input_ids) for _input_ids in tokenized_paraphrases]
-                # attention_mask = [torch.tensor([1] * len(_input_ids)) for _input_ids in input_ids]
+                    try:
+                        item = json.loads(text)
+                    except:
+                        print('load error:', text)
+                        # input()
+                        continue
+                    ctx_a = item['ctx_a'].strip()
+                    ctx_b = item['ctx_b'].strip()
+                    if 'ending_options' in item:
+                        options = item['ending_options']
+                    else:
+                        options = item['endings']
+                    options = [option.strip() for option in options]
+                    options = [options[label]] + options[:label] + options[label + 1:]
 
-                # example = {'input_ids': input_ids,
-                #             'attention_mask': attention_mask,
-                #             'num_paraphrases': len(input_ids) - 2,
-                #             'paraphrases': current_paraphrases}
-                example = {'num_paraphrases': len(current_paraphrases),
-                            'paraphrases': options + current_paraphrases}
+                    try:
+                        ctx_b = ctx_b[0].upper() + ctx_b[1:]
 
-                self.examples.append(example)
+                    except:
+                        print(ctx_a)
+                        print(ctx_b)
+                        continue
 
-                options = []
+                    current_paraphrases = paraphrases[0]
+                    paraphrases = paraphrases[1:]
+
+                    example = {'num_paraphrases': len(current_paraphrases),
+                        'paraphrases': [ctx_b + ' ' + option for option in options + current_paraphrases]}
+
+                    self.examples.append(example)
+
+        assert len(paraphrases) == 0
 
     def __len__(self):
         return len(self.examples)
@@ -550,9 +552,10 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
             # h_cls = h_cls - mean_state
 
             pos_scores = scale_scores(util.pytorch_cos_sim(paraphrase_embeddings[0], paraphrase_embeddings[2:])[0])
-            neg_scores = scale_scores(util.pytorch_cos_sim(paraphrase_embeddings[1], paraphrase_embeddings[2:])[0])
-            acc.append(float(pos_scores.mean().item() > neg_scores.mean().item()))
-            all_scores.extend([pos_scores.mean().item(), neg_scores.mean().item()])
+            neg_scores = [scale_scores(util.pytorch_cos_sim(paraphrase_embeddings[negative_id], paraphrase_embeddings[2:])[0]) for negative_id in range(1,4)]
+            
+            acc.append(float(pos_scores.mean().item() > max([neg_score.mean().item() for neg_score in neg_scores])))
+            all_scores.extend([pos_scores.mean().item()] + [neg_score.mean().item() for neg_score in neg_scores])
 
             print('============Example %d: accumulated accuracy is %f=============' % (len(acc), np.mean(acc)))
             if acc[-1] > 0:
@@ -560,11 +563,11 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
             else:
                 print('Wrong prediction!')
             print('Positive score:', pos_scores.mean().item())
-            print('Negative score:', neg_scores.mean().item())
+            print('Negative score:', [neg_score.mean().item() for neg_score in neg_scores])
             print('Positive option:', paraphrases[0])
-            logging_info(pos_scores, paraphrases[2:])
+            logging_info(pos_scores, paraphrases[4:])
             print('Negative option:', paraphrases[1])
-            logging_info(neg_scores, paraphrases[2:])
+            logging_info(neg_scores[0], paraphrases[4:])
 
     result = {"acc": np.mean(acc),
             "Max score": max(all_scores),

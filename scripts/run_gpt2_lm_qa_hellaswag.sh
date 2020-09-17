@@ -1,0 +1,2 @@
+# generation
+python ./src/method1/run_gpt2_lm_qa_hellaswag.py --model_name_or_path=/home/niuyilin/pre-trained-models/gpt2-large --output_dir=/home/niuyilin/pre-trained-models/gpt2-large --model_type=gpt2 --train_data_file=./data/HellaSWAG/hellaswag-train-dev/train.jsonl --eval_data_file=./data/HellaSWAG/hellaswag-train-dev/valid.jsonl --do_generate --repetition_penalty=1
